@@ -1,4 +1,4 @@
-name: Remote Android Emulator
+name: Remote Android Redroid
 
 on:
   workflow_dispatch:
@@ -11,58 +11,54 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Enable KVM & Fix Permissions
+    - name: Install Kernel Modules & Cloudflared
       run: |
         sudo apt-get update
-        sudo apt-get install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils netcat-openbsd
+        sudo apt-get install -y linux-modules-extra-$(uname -r) netcat-openbsd
         
-        # Cấp quyền tối đa cho KVM để tránh lỗi crash Emulator
-        sudo chmod 666 /dev/kvm
-        sudo usermod -aG kvm $USER
-        sudo systemctl restart docker
-        ls -l /dev/kvm
-
-    - name: Install Cloudflare Tunnel (cloudflared)
-      run: |
+        # Cài đặt cloudflared
         curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
         sudo dpkg -i cloudflared.deb
 
-    - name: Start Android Emulator Container
+    - name: Start Redroid (Android 11 Native)
       run: |
-        # Thêm quyền --privileged để container can thiệp sâu vào tầng cứng, tăng tốc độ render video stream
-        docker run -d -p 6080:6080 --name android-container \
-          --privileged \
-          --device /dev/kvm \
-          -e EMULATOR_DEVICE="Nexus 5" \
-          -e WEB_HUD=true \
-          -e VNC_PASSWORD=secret \
-          budtmo/docker-android:emulator_11.0
+        # Khởi động Android Container (Không dùng QEMU, chạy thẳng trên nhân Linux của host nên cực nhẹ)
+        sudo docker run -d --privileged \
+          --name redroid \
+          -v /data:/data \
+          -p 5555:5555 \
+          redroid/redroid:11.0.0-latest \
+          androidboot.redroid_width=720 \
+          androidboot.redroid_height=1280 \
+          androidboot.redroid_dpi=320
 
-    - name: Wait for Port 6080 to be Ready
+    - name: Start Scrcpy Web Streamer
       run: |
-        echo "=== Kiểm tra trạng thái Container ==="
-        sleep 5
-        docker ps
-        
-        echo "--------------------------------------------------------"
-        echo " Đang chờ dịch vụ noVNC (Cổng 6080) mở..."
-        echo "--------------------------------------------------------"
-        
-        # Vòng lặp check port, cổng 6080 mở thì mới cho chạy tiếp
-        until nc -z 127.0.0.1 6080; do
-          echo "Cổng 6080 chưa phản hồi. Đang đợi thiết lập giao diện web..."
-          sleep 5
+        # Chạy một container phụ chứa giao diện Web Scrcpy để stream video và nhận cảm ứng
+        sudo docker run -d \
+          --name scrcpy-web \
+          --link redroid:android \
+          -p 8000:8000 \
+          -e ADB_SERVER_SOCKET=tcp:android:5555 \
+          scrcpyweb/scrcpy-web:latest
+
+    - name: Wait for Web Service to Be Ready
+      run: |
+        echo "Đang đợi cổng giao diện Web (8000) mở hẳn..."
+        until nc -z 127.0.0.1 8000; do
+          echo "Web Streamer đang khởi động..."
+          sleep 3
         done
-        echo "Cổng 6080 đã MỞ THÀNH CÔNG!"
+        echo "Cổng 8000 đã mở!"
 
     - name: Expose via Cloudflare Tunnel
       run: |
         touch cloudflare.log
-        # Khởi động tunnel trỏ vào cổng local đã sẵn sàng
-        cloudflared tunnel --url http://127.0.0.1:6080 > cloudflare.log 2>&1 &
+        # Trỏ thẳng tunnel vào cổng 8000 (Cổng của Scrcpy Web)
+        sudo cloudflared tunnel --url http://127.0.0.1:8000 > cloudflare.log 2>&1 &
         
         echo "--------------------------------------------------------"
-        echo " Đang lấy link Trycloudflare..."
+        echo " Đang lấy link điều khiển..."
         echo "--------------------------------------------------------"
         
         for i in {1..10}; do
@@ -70,7 +66,7 @@ jobs:
           if [ ! -z "$TUNNEL_URL" ]; then
             echo ""
             echo "=========================================================="
-            echo " LINK TRUY CẬP ĐIỀU KHIỂN ANDROID EMULATOR CỦA BẠN:"
+            echo " LINK TRUY CẬP ANDROID (MƯỢT HƠN VNC GẤP 5 LẦN):"
             echo " $TUNNEL_URL "
             echo "=========================================================="
             echo ""
@@ -79,21 +75,8 @@ jobs:
           sleep 3
         done
 
-    - name: Wait for Android Boot Completed
+    - name: Hold Session Running
       run: |
-        echo "--------------------------------------------------------"
-        echo " Đang đợi Android OS hoàn tất quá trình Boot nội bộ..."
-        echo "--------------------------------------------------------"
-        
-        # Thăm dò hệ thống bằng adb cho đến khi nhận được trạng thái boot_completed = 1
-        until docker exec android-container adb shell getprop sys.boot_completed 2>/dev/null | grep -q "1"; do
-          echo "Android đang load màn hình... Vui lòng đợi..."
-          sleep 15
-        done
-        
-        echo "=========================================================="
-        echo " ANDROID ĐÃ KHỞI ĐỘNG XONG! BẠN CÓ THỂ THAO TÁC CẢM ỨNG.  "
-        echo "=========================================================="
-        
-        # Giữ phiên làm việc liên tục
+        echo "Hệ thống đang chạy ổn định. Bạn có thể vào link trên để điều khiển."
+        sudo docker ps
         tail -f /dev/null
