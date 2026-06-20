@@ -1,4 +1,4 @@
-name: Remote Android Redroid
+name: Remote Android All-In-One
 
 on:
   workflow_dispatch:
@@ -11,54 +11,54 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Install Kernel Modules & Cloudflared
+    - name: Enable KVM & Install Cloudflared
       run: |
         sudo apt-get update
-        sudo apt-get install -y linux-modules-extra-$(uname -r) netcat-openbsd
+        sudo apt-get install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils netcat-openbsd
+        
+        # Cấp quyền tối đa cho KVM phần cứng trên Runner
+        sudo chmod 666 /dev/kvm
+        sudo usermod -aG kvm $USER
+        sudo systemctl restart docker
         
         # Cài đặt cloudflared
         curl -L --output cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
         sudo dpkg -i cloudflared.deb
 
-    - name: Start Redroid (Android 11 Native)
+    - name: Start Dockerify Android (Emulator + Scrcpy Web)
       run: |
-        # Khởi động Android Container (Không dùng QEMU, chạy thẳng trên nhân Linux của host nên cực nhẹ)
+        # Chạy single-container tích hợp sẵn Emulator và Web Streamer trên cổng 8000
         sudo docker run -d --privileged \
-          --name redroid \
-          -v /data:/data \
-          -p 5555:5555 \
-          redroid/redroid:11.0.0-latest \
-          androidboot.redroid_width=720 \
-          androidboot.redroid_height=1280 \
-          androidboot.redroid_dpi=320
-
-    - name: Start Scrcpy Web Streamer
-      run: |
-        # Chạy một container phụ chứa giao diện Web Scrcpy để stream video và nhận cảm ứng
-        sudo docker run -d \
-          --name scrcpy-web \
-          --link redroid:android \
+          --name android-all-in-one \
+          --device /dev/kvm \
           -p 8000:8000 \
-          -e ADB_SERVER_SOCKET=tcp:android:5555 \
-          scrcpyweb/scrcpy-web:latest
+          -p 5555:5555 \
+          -e RAM_SIZE=4096 \
+          -e SCREEN_RESOLUTION=720x1280 \
+          -e SCREEN_DENSITY=320 \
+          shmayro/dockerify-android:latest
 
     - name: Wait for Web Service to Be Ready
       run: |
-        echo "Đang đợi cổng giao diện Web (8000) mở hẳn..."
+        echo "--------------------------------------------------------"
+        echo " Đang chờ giao diện Web Scrcpy (Cổng 8000) kích hoạt..."
+        echo "--------------------------------------------------------"
+        
+        # Chờ cho đến khi web service phản hồi kết nối
         until nc -z 127.0.0.1 8000; do
-          echo "Web Streamer đang khởi động..."
-          sleep 3
+          echo "Dịch vụ Web đang khởi tạo..."
+          sleep 5
         done
-        echo "Cổng 8000 đã mở!"
+        echo "Cổng 8000 đã hoạt động ổn định!"
 
     - name: Expose via Cloudflare Tunnel
       run: |
         touch cloudflare.log
-        # Trỏ thẳng tunnel vào cổng 8000 (Cổng của Scrcpy Web)
+        # Trỏ Tunnel trực tiếp vào cổng 8000 của container tổng hợp
         sudo cloudflared tunnel --url http://127.0.0.1:8000 > cloudflare.log 2>&1 &
         
         echo "--------------------------------------------------------"
-        echo " Đang lấy link điều khiển..."
+        echo " Đang cào link public từ Cloudflare..."
         echo "--------------------------------------------------------"
         
         for i in {1..10}; do
@@ -66,7 +66,7 @@ jobs:
           if [ ! -z "$TUNNEL_URL" ]; then
             echo ""
             echo "=========================================================="
-            echo " LINK TRUY CẬP ANDROID (MƯỢT HƠN VNC GẤP 5 LẦN):"
+            echo " LINK ĐIỀU KHIỂN ANDROID EMULATOR (SCRCPY-WEB):"
             echo " $TUNNEL_URL "
             echo "=========================================================="
             echo ""
@@ -75,8 +75,21 @@ jobs:
           sleep 3
         done
 
-    - name: Hold Session Running
+    - name: Monitor Android Boot Status
       run: |
-        echo "Hệ thống đang chạy ổn định. Bạn có thể vào link trên để điều khiển."
-        sudo docker ps
+        echo "--------------------------------------------------------"
+        echo " Đang đợi thiết bị Android ảo hoàn tất quá trình Boot..."
+        echo "--------------------------------------------------------"
+        
+        # Thăm dò ADB bên trong container All-In-One cho tới khi nhận trạng thái boot xong
+        until sudo docker exec android-all-in-one adb shell getprop sys.boot_completed 2>/dev/null | grep -q "1"; do
+          echo "Android đang tải hệ điều hành..."
+          sleep 15
+        done
+        
+        echo "=========================================================="
+        echo " ANDROID ĐÃ SẴN SÀNG! Mở link Trycloudflare để trải nghiệm."
+        echo "=========================================================="
+        
+        # Duy trì Runner hoạt động liên tục
         tail -f /dev/null
