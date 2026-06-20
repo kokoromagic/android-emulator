@@ -1,7 +1,7 @@
 name: Remote Android Emulator
 
 on:
-  workflow_dispatch: # Cho phép nhấn nút "Run workflow" thủ công từ giao diện GitHub
+  workflow_dispatch:
 
 jobs:
   run-emulator:
@@ -11,13 +11,15 @@ jobs:
     - name: Checkout Repository
       uses: actions/checkout@v4
 
-    - name: Enable KVM (Hardware Acceleration)
+    - name: Enable KVM & Fix Permissions
       run: |
-        # Kiểm tra và cấp quyền cho KVM để Emulator chạy mượt, không bị lag cực hạn
         sudo apt-get update
-        sudo apt-get install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils
-        sudo adduser $USER kvm
-        sudo chown root:kvm /dev/kvm
+        sudo apt-get install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils netcat-openbsd
+        
+        # Cấp quyền tối đa cho KVM để tránh lỗi crash Emulator
+        sudo chmod 666 /dev/kvm
+        sudo usermod -aG kvm $USER
+        sudo systemctl restart docker
         ls -l /dev/kvm
 
     - name: Install Cloudflare Tunnel (cloudflared)
@@ -27,31 +29,71 @@ jobs:
 
     - name: Start Android Emulator Container
       run: |
-        # Sử dụng image docker-android có sẵn giao diện Web qua cổng 6080 (noVNC)
-        # Chọn phiên bản Android 11 (API 30) để cân bằng giữa hiệu năng và tính năng
+        # Thêm quyền --privileged để container can thiệp sâu vào tầng cứng, tăng tốc độ render video stream
         docker run -d -p 6080:6080 --name android-container \
+          --privileged \
           --device /dev/kvm \
           -e EMULATOR_DEVICE="Nexus 5" \
           -e WEB_HUD=true \
           -e VNC_PASSWORD=secret \
           budtmo/docker-android:emulator_11.0
 
-        echo "Đang khởi động Emulator, vui lòng đợi trong giây lát..."
-        sleep 30 # Đợi container thiết lập ban đầu
+    - name: Wait for Port 6080 to be Ready
+      run: |
+        echo "=== Kiểm tra trạng thái Container ==="
+        sleep 5
+        docker ps
+        
+        echo "--------------------------------------------------------"
+        echo " Đang chờ dịch vụ noVNC (Cổng 6080) mở..."
+        echo "--------------------------------------------------------"
+        
+        # Vòng lặp check port, cổng 6080 mở thì mới cho chạy tiếp
+        until nc -z 127.0.0.1 6080; do
+          echo "Cổng 6080 chưa phản hồi. Đang đợi thiết lập giao diện web..."
+          sleep 5
+        done
+        echo "Cổng 6080 đã MỞ THÀNH CÔNG!"
 
     - name: Expose via Cloudflare Tunnel
       run: |
+        touch cloudflare.log
+        # Khởi động tunnel trỏ vào cổng local đã sẵn sàng
+        cloudflared tunnel --url http://127.0.0.1:6080 > cloudflare.log 2>&1 &
+        
+        echo "--------------------------------------------------------"
+        echo " Đang lấy link Trycloudflare..."
+        echo "--------------------------------------------------------"
+        
+        for i in {1..10}; do
+          TUNNEL_URL=$(grep -oE "https://[a-zA-Z0-9.-]+\.trycloudflare\.com" cloudflare.log | head -n 1)
+          if [ ! -z "$TUNNEL_URL" ]; then
+            echo ""
+            echo "=========================================================="
+            echo " LINK TRUY CẬP ĐIỀU KHIỂN ANDROID EMULATOR CỦA BẠN:"
+            echo " $TUNNEL_URL "
+            echo "=========================================================="
+            echo ""
+            break
+          fi
+          sleep 3
+        done
+
+    - name: Wait for Android Boot Completed
+      run: |
+        echo "--------------------------------------------------------"
+        echo " Đang đợi Android OS hoàn tất quá trình Boot nội bộ..."
+        echo "--------------------------------------------------------"
+        
+        # Thăm dò hệ thống bằng adb cho đến khi nhận được trạng thái boot_completed = 1
+        until docker exec android-container adb shell getprop sys.boot_completed 2>/dev/null | grep -q "1"; do
+          echo "Android đang load màn hình... Vui lòng đợi..."
+          sleep 15
+        done
+        
         echo "=========================================================="
-        echo " TRUY CẬP ĐƯỜNG DẪN TRYCLOUDFLARE DƯỚI ĐÂY ĐỂ ĐIỀU KHIỂN "
+        echo " ANDROID ĐÃ KHỞI ĐỘNG XONG! BẠN CÓ THỂ THAO TÁC CẢM ỨNG.  "
         echo "=========================================================="
         
-        # Chạy cloudflared tunnel trỏ vào cổng 6080 (giao diện web của emulator)
-        # Dùng lệnh tail để giữ workflow không bị dừng lại cho đến khi hết timeout của GA (6 tiếng)
-        cloudflared tunnel --url http://localhost:6080 2>&1 | tee cloudflare.log &
-        
-        # Đợi 5 giây để tunnel khởi tạo và lấy public URL từ log
-        sleep 5
-        grep -oE "https://[a-zA-Z0-9.-]+\.trycloudflare\.com" cloudflare.log || true
-        
-        # Giữ session chạy liên tục
+        # Giữ phiên làm việc liên tục
         tail -f /dev/null
